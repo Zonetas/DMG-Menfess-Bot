@@ -102,6 +102,8 @@ def muat_data():
     cfg.setdefault("delay", DEFAULT_DELAY)
     cfg.setdefault("blacklist", [])
     cfg.setdefault("blacklist_enabled", True)
+    cfg.setdefault("hashtags", [])
+    cfg.setdefault("force_subs", [])
     return data
 
 
@@ -205,24 +207,108 @@ def link_post(chat, message_id):
 
 # ==================== USER UI ====================
 def keyboard_utama():
-    post_name = cfg().get("post_name") or "Channel"
+    post_name = cfg().get("post_name") or "Channel/Grup Post"
     username = str(post_name).lstrip("@")
     buttons = [InlineKeyboardButton("📖 Panduan", callback_data="ui:panduan")]
     if username and not username.startswith("-") and " " not in username:
-        buttons.append(InlineKeyboardButton("📢 Channel", url=f"https://t.me/{username}"))
+        buttons.append(InlineKeyboardButton("📢 Channel/Grup Post", url=f"https://t.me/{username}"))
     return InlineKeyboardMarkup([buttons])
+
+
+def hashtag_valid(text):
+    allowed = {str(x).lower().lstrip("#") for x in cfg().get("hashtags", [])}
+    if not allowed:
+        return False
+    match = re.match(r"^\s*(#[A-Za-z0-9_]+)(?:\s|$)", text or "")
+    return bool(match and match.group(1)[1:].lower() in allowed)
+
+
+def teks_hashtag_tidak_valid():
+    tags = cfg().get("hashtags", [])
+    if not tags:
+        return "❌ Hashtag belum dikonfigurasi admin. Silakan hubungi admin."
+    daftar = "\n".join("• #" + escape(str(x).lstrip("#")) for x in tags)
+    return ("❌ Pesan harus diawali salah satu hashtag wajib.\n\n"
+            "Hashtag yang tersedia:\n" + daftar)
+
+
+async def cek_force_sub(context, user_id):
+    if user_id in ADMIN_IDS:
+        return True
+    for item in cfg().get("force_subs", []):
+        if not item.get("enabled", True):
+            continue
+        try:
+            member = await context.bot.get_chat_member(item["chat_id"], user_id)
+            if member.status in ("left", "kicked"):
+                return False
+            if member.status == "restricted" and not getattr(member, "is_member", False):
+                return False
+        except TelegramError:
+            return False
+    return True
+
+
+def keyboard_force_sub():
+    rows = []
+    for item in cfg().get("force_subs", []):
+        if item.get("enabled", True):
+            rows.append([InlineKeyboardButton(
+                "📢 Gabung " + str(item.get("title") or "Grup/Channel")[:45],
+                url=item["link"]
+            )])
+    rows.append([InlineKeyboardButton("🔄 Saya sudah bergabung", callback_data="ui:cek_sub")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def tampilkan_force_sub(message):
+    await message.reply_text(
+        "🔒 <b>AKSES BELUM TERBUKA</b>\n\n"
+        "Silakan bergabung ke semua grup/channel berikut terlebih dahulu, "
+        "lalu tekan tombol pemeriksaan.",
+        parse_mode="HTML", reply_markup=keyboard_force_sub()
+    )
+
+
+async def kirim_sambutan(message, user):
+    post_name = escape(str(cfg().get("post_name") or "Channel/Grup Post"))
+    fullname = escape(user.full_name or user.first_name or "User")
+    tags = cfg().get("hashtags", [])
+    hashtag_text = " ".join("#" + escape(str(x).lstrip("#")) for x in tags) if tags else "Belum diatur admin"
+    teks = (
+        "💌 <b>DMG MENFESS</b>\n\n"
+        f"Hello, {fullname}!\n\n"
+        f"Layanan auto-post menfess menuju <b>{post_name}</b>.\n\n"
+        "<b>HOW TO SEND</b>\n"
+        "1. Baca rules terlebih dahulu.\n"
+        "2. Gunakan hashtag di awal pesan.\n"
+        "3. Kirim teks, foto, atau video.\n\n"
+        f"<b>HASHTAGS</b>\n{hashtag_text}\n\n"
+        "<i>Contoh: #fwbgirl halo semuanya!</i>"
+    )
+    await message.reply_text(teks, parse_mode="HTML", reply_markup=keyboard_utama())
 
 
 async def ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.data == "ui:cek_sub":
+        if await cek_force_sub(context, query.from_user.id):
+            await query.answer("Berhasil! Akses dibuka.")
+            await kirim_sambutan(query.message, query.from_user)
+        else:
+            await query.answer("Kamu belum bergabung ke semua tujuan.", show_alert=True)
+        return
     await query.answer()
     if query.data == "ui:panduan":
+        tags = cfg().get("hashtags", [])
+        tag_text = ", ".join("#" + str(x).lstrip("#") for x in tags) if tags else "Belum diatur admin"
         await query.message.reply_text(
             "📖 <b>PANDUAN MENFESS</b>\n\n"
-            "1. Ketik pesan atau kirim media di chat bot.\n"
-            "2. Teks akan diterbitkan setelah lolos pemeriksaan.\n"
-            "3. Foto/video/dokumen harus disetujui admin terlebih dahulu.\n\n"
-            "⚠️ Jangan mengirim spam atau konten terlarang.",
+            "1. Baca rules terlebih dahulu.\n"
+            "2. Letakkan hashtag wajib di awal teks/caption.\n"
+            "3. Kirim teks, foto, atau video.\n"
+            "4. Media harus disetujui admin sebelum diterbitkan.\n\n"
+            f"🏷️ Hashtag: {escape(tag_text)}",
             parse_mode="HTML",
         )
 
@@ -231,18 +317,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     catat_user(user)
     await simpan_data()
-    data = ambil_data(user.id)
-    quota = int(cfg()["quota"])
-    delay = int(cfg()["delay"])
-    remaining = max(0, quota - int(data.get("terpakai", 0)))
-    teks = (
-        "🖤 <b>DMG MENFESS</b>\n<i>Anonymous Message System</i>\n\n"
-        f"Halo, <b>{escape(user.first_name or 'User')}</b>!\n"
-        "Selamat datang di layanan menfess.\n\n"
-        f"📦 Kuota: {remaining}/{quota}\n⏱️ Cooldown: {delay} detik\n\n"
-        "Ketik pesanmu langsung di chat ini atau pilih Panduan."
-    )
-    await update.message.reply_text(teks, parse_mode="HTML", reply_markup=keyboard_utama())
+    if not await cek_force_sub(context, user.id):
+        await tampilkan_force_sub(update.effective_message)
+        return
+    await kirim_sambutan(update.effective_message, user)
 
 
 # ==================== BLACKLIST ====================
@@ -303,6 +381,9 @@ async def proses_media(update, context):
     if not message or not user:
         return
     catat_user(user)
+    if not await cek_force_sub(context, user.id):
+        await tampilkan_force_sub(message)
+        return
     if str(user.id) in DB["ban"]:
         await message.reply_text("🚫 Kamu di-ban dan tidak bisa mengirim menfess.")
         return
@@ -316,6 +397,9 @@ async def proses_media(update, context):
         await message.reply_text(f"⏳ Tunggu {int(wait) + 1} detik sebelum mengirim lagi.")
         return
     caption = message.caption or ""
+    if not hashtag_valid(caption):
+        await message.reply_text(teks_hashtag_tidak_valid(), parse_mode="HTML")
+        return
     blocked = kata_terlarang(caption)
     if blocked:
         await message.reply_text("⛔ Media ditolak karena caption mengandung kata yang masuk blacklist.")
@@ -445,10 +529,16 @@ async def kirim_menfess(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not user or not message.text:
         return
     catat_user(user)
+    if not await cek_force_sub(context, user.id):
+        await tampilkan_force_sub(message)
+        return
     if str(user.id) in DB["ban"]:
         await message.reply_text("🚫 Kamu di-ban dan tidak bisa mengirim menfess.")
         return
     isi = message.text.strip()
+    if not hashtag_valid(isi):
+        await message.reply_text(teks_hashtag_tidak_valid(), parse_mode="HTML")
+        return
     blocked = kata_terlarang(isi)
     if blocked:
         await message.reply_text("⛔ Pesan ditolak karena mengandung kata/frasa yang masuk blacklist.")
@@ -609,6 +699,8 @@ def tombol_settings():
         [InlineKeyboardButton("⏱️ Atur Cooldown", callback_data="setting:delay")],
         [InlineKeyboardButton("📦 Atur Kuota Harian", callback_data="setting:quota")],
         [InlineKeyboardButton("🚫 Blacklist kata", callback_data="setting:blacklist")],
+        [InlineKeyboardButton("🏷️ Hashtag wajib", callback_data="setting:hashtags")],
+        [InlineKeyboardButton("🔒 Force Subscribe", callback_data="setting:forcesub")],
         [InlineKeyboardButton("⬅️ Kembali", callback_data="panel:menu")],
     ])
 
@@ -705,7 +797,9 @@ async def panel_callback(update, context):
             f"📢 Post: {escape(str(c.get('post_name') or c.get('post_chat_id') or 'Belum diatur'))}\n"
             f"📋 Logs: {escape(str(c.get('log_chat_id') or 'Belum diatur'))}\n"
             f"⏱️ Cooldown: {c['delay']} detik\n📦 Kuota: {c['quota']} per hari\n"
-            f"🚫 Blacklist: {'Aktif' if c['blacklist_enabled'] else 'Nonaktif'}",
+            f"🚫 Blacklist: {'Aktif' if c['blacklist_enabled'] else 'Nonaktif'}\n"
+            f"🏷️ Hashtag: {len(c.get('hashtags', []))}\n"
+            f"🔒 Force Subscribe: {len([x for x in c.get('force_subs', []) if x.get('enabled', True)])} aktif",
             parse_mode="HTML", reply_markup=tombol_settings(),
         )
     elif action in ("users", "banlist", "ban", "unban", "broadcast", "status"):
@@ -741,13 +835,35 @@ async def panel_callback(update, context):
         await query.message.delete()
 
 
+async def settings_callback_refresh_fsub(query):
+    tujuan = cfg().get("force_subs", [])
+    lines = [f"🔒 <b>FORCE SUBSCRIBE ({len(tujuan)}/3)</b>", ""]
+    rows = []
+    for i, item in enumerate(tujuan):
+        status = "Aktif" if item.get("enabled", True) else "Nonaktif"
+        lines.append(f"{i+1}. {escape(str(item.get('title') or item.get('chat_id')))} — {status}")
+        rows.append([
+            InlineKeyboardButton(("🟢 " if item.get("enabled", True) else "🔴 ") + f"Toggle {i+1}",
+                                 callback_data=f"setting:fsub_toggle:{i}"),
+            InlineKeyboardButton(f"🗑 Hapus {i+1}", callback_data=f"setting:fsub_remove:{i}")
+        ])
+    if len(tujuan) < 3:
+        rows.append([InlineKeyboardButton("➕ Tambah tujuan", callback_data="setting:fsub_add")])
+    rows.append([InlineKeyboardButton("⬅️ Kembali", callback_data="panel:settings")])
+    await query.edit_message_text(
+        "\n".join(lines) + "\n\nPengguna wajib bergabung ke semua tujuan yang aktif.",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
 async def settings_callback(update, context):
     query = update.callback_query
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("Khusus admin.", show_alert=True); return
     await query.answer()
     action = query.data.split(":", 1)[1]
-    if action in ("post", "logs", "delay", "quota", "blacklist_add", "blacklist_remove"):
+    if action in ("post", "logs", "delay", "quota", "blacklist_add", "blacklist_remove",
+                  "hashtag_add", "hashtag_remove", "fsub_add"):
         context.user_data["menunggu"] = "setting_" + action
         prompts = {
             "post": "Kirim ID atau username Channel/Group untuk tujuan Post.\nContoh: -1001234567890 atau @username",
@@ -756,8 +872,43 @@ async def settings_callback(update, context):
             "quota": "Kirim kuota menfess per hari. Contoh: 100",
             "blacklist_add": "Kirim kata/frasa yang ingin ditambahkan ke blacklist.",
             "blacklist_remove": "Kirim kata/frasa yang ingin dihapus dari blacklist.",
+            "hashtag_add": "Kirim hashtag yang ingin ditambahkan. Contoh: #fwbgirl",
+            "hashtag_remove": "Kirim hashtag yang ingin dihapus. Contoh: #fwbgirl",
+            "fsub_add": (
+                "Kirim ID/username tujuan dan link join dipisahkan tanda |.\n"
+                "Contoh: @namachannel | https://t.me/namachannel\n"
+                "Untuk tujuan privat, gunakan ID -100... dan link undangan."
+            ),
         }
         await query.message.reply_text(prompts[action] + "\nKetik /batal untuk membatalkan.")
+    elif action == "hashtags":
+        tags = cfg().get("hashtags", [])
+        display = "\n".join("• #" + escape(str(x).lstrip("#")) for x in tags) if tags else "Belum ada hashtag."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Tambah hashtag", callback_data="setting:hashtag_add")],
+            [InlineKeyboardButton("➖ Hapus hashtag", callback_data="setting:hashtag_remove")],
+            [InlineKeyboardButton("⬅️ Kembali", callback_data="panel:settings")],
+        ])
+        await query.edit_message_text(
+            "🏷️ <b>HASHTAG WAJIB</b>\n\nPesan harus diawali salah satu hashtag terdaftar.\n\n" + display,
+            parse_mode="HTML", reply_markup=keyboard
+        )
+    elif action == "forcesub":
+        await settings_callback_refresh_fsub(query)
+    elif action.startswith("fsub_toggle:"):
+        index = int(action.split(":")[1])
+        tujuan = cfg().get("force_subs", [])
+        if 0 <= index < len(tujuan):
+            tujuan[index]["enabled"] = not tujuan[index].get("enabled", True)
+            await simpan_data()
+        await settings_callback_refresh_fsub(query)
+    elif action.startswith("fsub_remove:"):
+        index = int(action.split(":")[1])
+        tujuan = cfg().get("force_subs", [])
+        if 0 <= index < len(tujuan):
+            tujuan.pop(index)
+            await simpan_data()
+        await settings_callback_refresh_fsub(query)
     elif action == "blacklist":
         words = cfg().get("blacklist", [])
         display = "\n".join("• " + escape(w) for w in words) if words else "Belum ada kata terlarang."
@@ -868,6 +1019,47 @@ async def input_admin(update, context):
                     raise ValueError("Kata tersebut tidak ditemukan.")
                 words.remove(match)
                 result = f"✅ Kata/frasa '{match}' dihapus dari blacklist."
+            elif setting == "hashtag_add":
+                tag = value.strip().lstrip("#").lower()
+                if not re.fullmatch(r"[a-z0-9_]{1,32}", tag):
+                    raise ValueError("Hashtag tidak valid. Gunakan huruf, angka, atau underscore.")
+                tags = cfg().setdefault("hashtags", [])
+                if tag in tags:
+                    raise ValueError("Hashtag tersebut sudah terdaftar.")
+                tags.append(tag)
+                result = f"✅ Hashtag #{tag} berhasil ditambahkan."
+            elif setting == "hashtag_remove":
+                tag = value.strip().lstrip("#").lower()
+                tags = cfg().setdefault("hashtags", [])
+                if tag not in tags:
+                    raise ValueError("Hashtag tidak ditemukan.")
+                tags.remove(tag)
+                result = f"✅ Hashtag #{tag} berhasil dihapus."
+            elif setting == "fsub_add":
+                tujuan = cfg().setdefault("force_subs", [])
+                if len(tujuan) >= 3:
+                    raise ValueError("Maksimal 3 tujuan Force Subscribe.")
+                if "|" not in value:
+                    raise ValueError("Format: ID/username | link join.")
+                raw_chat, link = [x.strip() for x in value.split("|", 1)]
+                if not link.startswith("https://t.me/"):
+                    raise ValueError("Link join harus berupa https://t.me/...")
+                chat = await context.bot.get_chat(raw_chat)
+                if chat.type not in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
+                    raise ValueError("Tujuan harus berupa grup atau channel.")
+                me = await context.bot.get_me()
+                bot_member = await context.bot.get_chat_member(chat.id, me.id)
+                if bot_member.status not in ("administrator", "creator"):
+                    raise ValueError("Bot harus menjadi admin di grup/channel.")
+                if any(str(x.get("chat_id")) == str(chat.id) for x in tujuan):
+                    raise ValueError("Tujuan tersebut sudah terdaftar.")
+                tujuan.append({
+                    "chat_id": chat.id,
+                    "title": chat.title or chat.username or str(chat.id),
+                    "link": link,
+                    "enabled": True,
+                })
+                result = f"✅ Force Subscribe ditambahkan: {chat.title or chat.username or chat.id}"
             else:
                 result = "Pengaturan tidak dikenal."
             await simpan_data()
@@ -939,7 +1131,7 @@ def main():
 
     app.add_handler(MessageHandler(private & ~filters.COMMAND, router_pesan))
     app.add_error_handler(tangani_error)
-    print("DMG Menfess Bot berjalan...")
+    print("DMG Menfess Bot berjalan🚀...")
     app.run_polling(timeout=20)
 
 

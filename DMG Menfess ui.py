@@ -1,23 +1,22 @@
 import asyncio
 import json
 import os
+import re
 import time
+import tempfile
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatType
+from telegram.error import TelegramError
 from telegram.ext import (
-    Application,
-    ApplicationHandlerStop,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler,
+    ContextTypes, MessageHandler, filters,
 )
 
-# Load private .env file from this folder. It is excluded from GitHub by .gitignore.
+# ==================== ENV ====================
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
 
@@ -25,13 +24,12 @@ ENV_FILE = BASE_DIR / ".env"
 def load_env_file():
     if not ENV_FILE.exists():
         return
-    for raw_line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
+    for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
 
@@ -41,9 +39,9 @@ load_env_file()
 
 def env_int(name, default=None):
     value = os.getenv(name)
-    if value is None or value == "":
+    if value in (None, ""):
         if default is None:
-            raise RuntimeError(f"Konfigurasi {name} belum diisi di file .env")
+            raise RuntimeError(f"Konfigurasi {name} belum diisi di .env")
         return default
     try:
         return int(value)
@@ -54,81 +52,102 @@ def env_int(name, default=None):
 def env_int_list(name):
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(f"Konfigurasi {name} belum diisi di file .env")
+        raise RuntimeError(f"Konfigurasi {name} belum diisi di .env")
     try:
-        return [int(item.strip()) for item in value.split(",") if item.strip()]
+        return [int(x.strip()) for x in value.split(",") if x.strip()]
     except ValueError as exc:
         raise RuntimeError(f"{name} harus berupa daftar ID angka dipisahkan koma.") from exc
 
 
-# ==================== KONFIGURASI RAHASIA ====================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-TARGET_CHAT_ID = env_int("TARGET_CHAT_ID")
-TARGET_NAME = os.getenv("TARGET_NAME", "").strip().lstrip("@")
 ADMIN_IDS = env_int_list("ADMIN_IDS")
-LOG_CHAT_ID = env_int("LOG_CHAT_ID")
-
-KUOTA_HARIAN = env_int("KUOTA_HARIAN", 100)
-DELAY = env_int("DELAY", 60)
+DEFAULT_POST_ID = os.getenv("TARGET_CHAT_ID", "").strip()
+DEFAULT_POST_NAME = os.getenv("TARGET_NAME", "").strip().lstrip("@")
+DEFAULT_LOG_ID = os.getenv("LOG_CHAT_ID", "").strip()
+DEFAULT_QUOTA = env_int("KUOTA_HARIAN", 100)
+DEFAULT_DELAY = env_int("DELAY", 60)
 UTC_OFFSET = env_int("UTC_OFFSET", 7)
-
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN belum diisi di file .env")
-if not TARGET_NAME:
-    raise RuntimeError("TARGET_NAME belum diisi di file .env")
+    raise RuntimeError("BOT_TOKEN belum diisi di .env")
 
-
-# ==================== DATABASE JSON ====================
-
+# ==================== JSON DATABASE ====================
 DATA_FILE = BASE_DIR / "menfess_data.json"
+DEFAULT_DATA = {
+    "ban": {}, "users": {}, "settings": {}, "usage": {},
+    "pending_media": {},
+}
 
 
 def muat_data():
     data = {}
     if DATA_FILE.exists():
         try:
-            with DATA_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
         except (json.JSONDecodeError, OSError):
+            # Simpan salinan file rusak sebelum memulai database kosong.
+            try:
+                DATA_FILE.replace(DATA_FILE.with_name("menfess_data.corrupt.json"))
+            except OSError:
+                pass
             data = {}
-
-    data.setdefault("ban", {})
-    data.setdefault("users", {})
+    for key, value in DEFAULT_DATA.items():
+        data.setdefault(key, value.copy() if isinstance(value, dict) else value)
+    cfg = data["settings"]
+    cfg.setdefault("post_chat_id", DEFAULT_POST_ID)
+    cfg.setdefault("post_name", DEFAULT_POST_NAME or "Tujuan Post")
+    cfg.setdefault("log_chat_id", DEFAULT_LOG_ID)
+    cfg.setdefault("quota", DEFAULT_QUOTA)
+    cfg.setdefault("delay", DEFAULT_DELAY)
+    cfg.setdefault("blacklist", [])
+    cfg.setdefault("blacklist_enabled", True)
     return data
-
-
-def simpan_data():
-    with DATA_FILE.open("w", encoding="utf-8") as f:
-        json.dump(DB, f, ensure_ascii=False, indent=2)
 
 
 DB = muat_data()
+SAVE_LOCK = asyncio.Lock()
 waktu_mulai = time.time()
-data_user = {}
+
+
+async def simpan_data():
+    async with SAVE_LOCK:
+        fd, tmp = tempfile.mkstemp(prefix="menfess-", suffix=".tmp", dir=BASE_DIR)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(DB, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, DATA_FILE)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+
+def cfg():
+    return DB["settings"]
+
+
+def adalah_admin(update):
+    return bool(update.effective_user and update.effective_user.id in ADMIN_IDS)
 
 
 def catat_user(user):
-    baru = {"username": user.username or "", "nama": user.first_name or ""}
-    if DB["users"].get(str(user.id)) != baru:
-        DB["users"][str(user.id)] = baru
-        simpan_data()
+    DB["users"][str(user.id)] = {
+        "username": user.username or "",
+        "nama": user.first_name or user.full_name or "",
+    }
 
 
 def ambil_data(user_id):
-    hari_ini = date.today()
-    data = data_user.get(user_id)
-    if data is None:
-        data = {"tanggal": hari_ini, "terpakai": 0, "terakhir": 0}
-        data_user[user_id] = data
-    elif data["tanggal"] != hari_ini:
-        data["tanggal"] = hari_ini
-        data["terpakai"] = 0
+    today = date.today().isoformat()
+    data = DB["usage"].setdefault(str(user_id), {})
+    if data.get("tanggal") != today:
+        data.update({"tanggal": today, "terpakai": 0, "terakhir": 0})
     return data
 
 
-# ==================== WAKTU DAN LOG ====================
-
+# ==================== TIME / LOG ====================
 BULAN = [
     "Januari", "Februari", "Maret", "April", "Mei", "Juni",
     "Juli", "Agustus", "September", "Oktober", "November", "Desember",
@@ -137,55 +156,61 @@ NAMA_ZONA = {7: "WIB", 8: "WITA", 9: "WIT"}
 
 
 def waktu_sekarang():
-    sekarang = datetime.now(timezone(timedelta(hours=UTC_OFFSET)))
+    now = datetime.now(timezone(timedelta(hours=UTC_OFFSET)))
     zona = NAMA_ZONA.get(UTC_OFFSET, f"UTC{UTC_OFFSET:+d}")
-    tanggal = f"{sekarang.day} {BULAN[sekarang.month - 1]} {sekarang.year}"
-    jam = sekarang.strftime("%H:%M:%S") + " " + zona
-    return tanggal, jam
+    return (
+        f"{now.day} {BULAN[now.month - 1]} {now.year}",
+        now.strftime("%H:%M:%S") + " " + zona,
+    )
 
 
 def papan_ban(uid):
-    if str(uid) in DB["ban"]:
-        tombol = InlineKeyboardButton("♻️ Unban user", callback_data=f"unban:{uid}")
-    else:
-        tombol = InlineKeyboardButton("🚫 Ban user", callback_data=f"ban:{uid}")
-    return InlineKeyboardMarkup([[tombol]])
+    action = "unban" if str(uid) in DB["ban"] else "ban"
+    label = "♻️ Unban user" if action == "unban" else "🚫 Ban user"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"{action}:{uid}")]])
 
 
 async def kirim_log(context, user, isi, link):
+    log_id = cfg().get("log_chat_id")
+    if not log_id:
+        return
     tanggal, jam = waktu_sekarang()
     username = f"@{escape(user.username)}" if user.username else "-"
     nama = escape(user.first_name or "User")
     mention = f'<a href="tg://user?id={user.id}">{nama}</a>'
     teks = (
         "📋 <b>LOG MENFESS</b>\n\n"
-        f"👤 Mention: {mention}\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"🔗 Username: {username}\n"
-        f"📅 Tanggal: {tanggal}\n"
-        f"🕒 Waktu: {jam}\n\n"
-        f"💬 Isi:\n{escape(isi)}\n\n"
-        f'📎 <a href="{link}">Buka postingan</a>'
+        f"👤 Mention: {mention}\n🆔 ID: <code>{user.id}</code>\n"
+        f"🔗 Username: {username}\n📅 Tanggal: {tanggal}\n🕒 Waktu: {jam}\n\n"
+        f"💬 Isi:\n{escape(isi or '[Media]')}\n\n"
+        f'📎 <a href="{escape(link, quote=True)}">Buka postingan</a>'
     )
     try:
         await context.bot.send_message(
-            chat_id=LOG_CHAT_ID,
-            text=teks,
-            parse_mode="HTML",
+            chat_id=log_id, text=teks, parse_mode="HTML",
             reply_markup=papan_ban(user.id),
         )
-        print("Log menfess berhasil dikirim.")
-    except Exception as error:
-        print("Gagal mengirim log:", error)
+    except TelegramError:
+        print("Gagal mengirim log:", log_id)
 
 
-# ==================== UI PENGGUNA ====================
+def link_post(chat, message_id):
+    if chat.username:
+        return f"https://t.me/{chat.username}/{message_id}"
+    chat_id = str(chat.id)
+    if chat_id.startswith("-100"):
+        return f"https://t.me/c/{chat_id[4:]}/{message_id}"
+    return ""
 
+
+# ==================== USER UI ====================
 def keyboard_utama():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📖 Panduan", callback_data="ui:panduan"),
-        InlineKeyboardButton("📢 Channel", url=f"https://t.me/{TARGET_NAME}"),
-    ]])
+    post_name = cfg().get("post_name") or "Channel"
+    username = str(post_name).lstrip("@")
+    buttons = [InlineKeyboardButton("📖 Panduan", callback_data="ui:panduan")]
+    if username and not username.startswith("-") and " " not in username:
+        buttons.append(InlineKeyboardButton("📢 Channel", url=f"https://t.me/{username}"))
+    return InlineKeyboardMarkup([buttons])
 
 
 async def ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,92 +219,273 @@ async def ui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "ui:panduan":
         await query.message.reply_text(
             "📖 <b>PANDUAN MENFESS</b>\n\n"
-            "1. Langsung ketik pesan yang ingin kamu kirim di chat bot.\n"
-            "2. Bot akan meneruskan pesanmu ke channel.\n"
-            "3. Tunggu konfirmasi berhasil.\n\n"
-            "⚠️ Jangan mengirim spam atau konten yang melanggar aturan.",
+            "1. Ketik pesan atau kirim media di chat bot.\n"
+            "2. Teks akan diterbitkan setelah lolos pemeriksaan.\n"
+            "3. Foto/video/dokumen harus disetujui admin terlebih dahulu.\n\n"
+            "⚠️ Jangan mengirim spam atau konten terlarang.",
             parse_mode="HTML",
         )
 
 
-# ==================== PERINTAH PENGGUNA ====================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     catat_user(user)
+    await simpan_data()
     data = ambil_data(user.id)
-    sisa = max(0, KUOTA_HARIAN - data["terpakai"])
+    quota = int(cfg()["quota"])
+    delay = int(cfg()["delay"])
+    remaining = max(0, quota - int(data.get("terpakai", 0)))
     teks = (
-        "🖤 <b>DMG MENFESS</b>\n"
-        "<i>Anonymous Message System</i>\n\n"
+        "🖤 <b>DMG MENFESS</b>\n<i>Anonymous Message System</i>\n\n"
         f"Halo, <b>{escape(user.first_name or 'User')}</b>!\n"
         "Selamat datang di layanan menfess.\n\n"
-        f"📦 Kuota: {sisa}/{KUOTA_HARIAN}\n"
-        f"⏱️ Delay: {DELAY} detik\n\n"
-        "Ketik pesanmu langsung di chat ini.\n"
-        "Atau pilih Panduan jika membutuhkan bantuan."
+        f"📦 Kuota: {remaining}/{quota}\n⏱️ Cooldown: {delay} detik\n\n"
+        "Ketik pesanmu langsung di chat ini atau pilih Panduan."
     )
-    await update.message.reply_text(
-        teks, parse_mode="HTML", reply_markup=keyboard_utama()
+    await update.message.reply_text(teks, parse_mode="HTML", reply_markup=keyboard_utama())
+
+
+# ==================== BLACKLIST ====================
+def normalize_word(text):
+    return re.sub(r"[\W_]+", "", text.casefold(), flags=re.UNICODE)
+
+
+def kata_terlarang(text):
+    if not cfg().get("blacklist_enabled", True):
+        return None
+    normalized = normalize_word(text)
+    for word in cfg().get("blacklist", []):
+        candidate = normalize_word(word)
+        if candidate and candidate in normalized:
+            return word
+    return None
+
+
+# ==================== MEDIA ====================
+def pesan_media(message):
+    return bool(
+        message.photo or message.video or message.animation or message.document
+        or message.audio or message.voice or message.video_note or message.sticker
     )
 
 
-async def kirim_menfess(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    isi = update.message.text
-    catat_user(user)
+def jenis_media(message):
+    if message.photo: return "Foto"
+    if message.video: return "Video"
+    if message.animation: return "GIF"
+    if message.document: return "Dokumen"
+    if message.audio: return "Audio"
+    if message.voice: return "Voice"
+    if message.video_note: return "Video note"
+    if message.sticker: return "Stiker"
+    return "Media"
 
-    if str(user.id) in DB["ban"]:
-        await update.message.reply_text("🚫 Kamu di-ban dan tidak bisa mengirim menfess.")
-        return
 
-    data = ambil_data(user.id)
-    if data["terpakai"] >= KUOTA_HARIAN:
-        await update.message.reply_text(
-            f"❌ Kuota hari ini sudah habis ({KUOTA_HARIAN}/{KUOTA_HARIAN}).\n"
-            "Coba lagi besok ya."
-        )
-        return
-
-    sisa_tunggu = DELAY - (time.time() - data["terakhir"])
-    if sisa_tunggu > 0:
-        await update.message.reply_text(
-            f"⏳ Tunggu {int(sisa_tunggu) + 1} detik lagi sebelum kirim pesan berikutnya."
-        )
-        return
-
-    pesan = await context.bot.send_message(
-        chat_id=TARGET_CHAT_ID,
-        text=f"🔰 {escape(isi)}",
-        parse_mode="HTML",
-    )
-    data["terpakai"] += 1
-    data["terakhir"] = time.time()
-    sisa = max(0, KUOTA_HARIAN - data["terpakai"])
-
-    if pesan.chat.username:
-        link = f"https://t.me/{pesan.chat.username}/{pesan.message_id}"
-    else:
-        link = f"https://t.me/c/{str(pesan.chat.id)[4:]}/{pesan.message_id}"
-
-    await kirim_log(context, user, isi, link)
-    tombol = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔗 Lihat postingan", url=link)
+async def notifikasi_admin_media(context, pending_id, user, caption, kind):
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔍 Periksa & putuskan", callback_data=f"media:review:{pending_id}")
     ]])
-    await update.message.reply_text(
-        "✅ <b>Menfess berhasil dikirim!</b>\n\n"
-        f"📦 Sisa kuota: {sisa}/{KUOTA_HARIAN}",
-        parse_mode="HTML",
-        reply_markup=tombol,
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"🆕 <b>MEDIA MENUNGGU PERSETUJUAN</b>\n"
+                f"ID: <code>{pending_id}</code>\nPengirim: {escape(user.full_name)}\n"
+                f"Jenis: {kind}\nCaption: {escape(caption or '-')}",
+                parse_mode="HTML", reply_markup=keyboard,
+            )
+        except TelegramError:
+            print("Tidak dapat mengirim notifikasi media ke admin:", admin_id)
+
+
+async def proses_media(update, context):
+    message, user = update.effective_message, update.effective_user
+    if not message or not user:
+        return
+    catat_user(user)
+    if str(user.id) in DB["ban"]:
+        await message.reply_text("🚫 Kamu di-ban dan tidak bisa mengirim menfess.")
+        return
+    data = ambil_data(user.id)
+    quota = int(cfg()["quota"])
+    if int(data.get("terpakai", 0)) >= quota:
+        await message.reply_text(f"❌ Kuota hari ini sudah habis ({quota}/{quota}).")
+        return
+    wait = int(cfg()["delay"]) - (time.time() - float(data.get("terakhir", 0)))
+    if wait > 0:
+        await message.reply_text(f"⏳ Tunggu {int(wait) + 1} detik sebelum mengirim lagi.")
+        return
+    caption = message.caption or ""
+    blocked = kata_terlarang(caption)
+    if blocked:
+        await message.reply_text("⛔ Media ditolak karena caption mengandung kata yang masuk blacklist.")
+        return
+    pending_id = str(int(time.time() * 1000))
+    DB["pending_media"][pending_id] = {
+        "user_id": user.id, "user_name": user.full_name,
+        "source_chat_id": message.chat_id, "source_message_id": message.message_id,
+        "caption": caption, "kind": jenis_media(message),
+        "created_at": int(time.time()),
+    }
+    await simpan_data()
+    await message.reply_text(
+        "🕒 Media kamu sudah masuk antrean pemeriksaan admin.\n"
+        "Media tidak akan diterbitkan sebelum disetujui."
+    )
+    await notifikasi_admin_media(context, pending_id, user, caption, jenis_media(message))
+
+
+async def terbitkan_media(context, pending_id, admin_id, query):
+    item = DB["pending_media"].get(pending_id)
+    if not item:
+        await query.message.reply_text("Kiriman sudah tidak ada atau sudah diproses.")
+        return
+    post_id = cfg().get("post_chat_id")
+    if not post_id:
+        await query.message.reply_text("Tujuan Post belum diatur. Atur melalui /panel.")
+        return
+    try:
+        copied = await context.bot.copy_message(
+            chat_id=post_id,
+            from_chat_id=item["source_chat_id"],
+            message_id=item["source_message_id"],
+        )
+        chat = await context.bot.get_chat(post_id)
+        link = link_post(chat, copied.message_id)
+        DB["pending_media"].pop(pending_id, None)
+        data = ambil_data(int(item["user_id"]))
+        data["terpakai"] = int(data.get("terpakai", 0)) + 1
+        data["terakhir"] = time.time()
+        await simpan_data()
+        try:
+            await context.bot.send_message(
+                item["user_id"], "✅ Media kamu disetujui dan berhasil diterbitkan."
+            )
+        except TelegramError:
+            pass
+        if link:
+            # Media log memakai format log yang sama.
+            fake_user = type("UserInfo", (), {
+                "id": int(item["user_id"]), "username": "",
+                "first_name": item.get("user_name", "User"),
+            })()
+            await kirim_log(context, fake_user, f"[{item['kind']}] {item.get('caption', '')}", link)
+        await query.edit_message_text(f"✅ Media #{pending_id} disetujui dan diterbitkan.")
+    except TelegramError as exc:
+        await query.message.reply_text(f"Gagal menerbitkan media. Periksa izin bot pada tujuan Post.\n{exc}")
+
+
+async def media_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Khusus admin.", show_alert=True)
+        return
+    await query.answer()
+    parts = query.data.split(":")
+    action = parts[1]
+    if action == "queue":
+        await tampilkan_antrean(query)
+        return
+    pending_id = parts[2]
+    item = DB["pending_media"].get(pending_id)
+    if not item:
+        await query.message.reply_text("Kiriman sudah diproses atau tidak tersedia.")
+        return
+    if action == "review":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Setujui & Post", callback_data=f"media:approve:{pending_id}"),
+            InlineKeyboardButton("❌ Tolak", callback_data=f"media:reject:{pending_id}"),
+        ], [InlineKeyboardButton("⬅️ Antrean", callback_data="media:queue")]])
+        await query.message.reply_text(
+            f"🖼️ <b>PEMERIKSAAN MEDIA</b>\nID: <code>{pending_id}</code>\n"
+            f"Pengirim: {escape(item['user_name'])}\nJenis: {item['kind']}\n"
+            f"Caption: {escape(item.get('caption') or '-')}",
+            parse_mode="HTML", reply_markup=keyboard,
+        )
+        try:
+            await context.bot.copy_message(
+                chat_id=query.from_user.id,
+                from_chat_id=item["source_chat_id"],
+                message_id=item["source_message_id"],
+            )
+        except TelegramError as exc:
+            await query.message.reply_text(f"Tidak bisa menampilkan media: {exc}")
+    elif action == "approve":
+        await terbitkan_media(context, pending_id, query.from_user.id, query)
+    elif action == "reject":
+        DB["pending_media"].pop(pending_id, None)
+        await simpan_data()
+        try:
+            await context.bot.send_message(item["user_id"], "❌ Maaf, media kamu ditolak admin.")
+        except TelegramError:
+            pass
+        await query.edit_message_text(f"❌ Media #{pending_id} ditolak dan tidak diterbitkan.")
+    elif action == "queue":
+        await tampilkan_antrean(query)
+
+
+async def tampilkan_antrean(query):
+    pending = DB["pending_media"]
+    if not pending:
+        await query.edit_message_text("🖼️ Tidak ada media yang menunggu.", reply_markup=tombol_kembali())
+        return
+    rows = []
+    for pid, item in list(pending.items())[:30]:
+        rows.append([InlineKeyboardButton(
+            f"{item.get('kind', 'Media')} · {item.get('user_name', 'User')[:20]} · #{pid[-5:]}",
+            callback_data=f"media:review:{pid}",
+        )])
+    rows.append([InlineKeyboardButton("⬅️ Kembali", callback_data="panel:menu")])
+    await query.edit_message_text("🖼️ <b>ANTREAN MEDIA</b>\nPilih kiriman untuk diperiksa:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+
+# ==================== TEXT MENFESS ====================
+async def kirim_menfess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message, user = update.effective_message, update.effective_user
+    if not message or not user or not message.text:
+        return
+    catat_user(user)
+    if str(user.id) in DB["ban"]:
+        await message.reply_text("🚫 Kamu di-ban dan tidak bisa mengirim menfess.")
+        return
+    isi = message.text.strip()
+    blocked = kata_terlarang(isi)
+    if blocked:
+        await message.reply_text("⛔ Pesan ditolak karena mengandung kata/frasa yang masuk blacklist.")
+        return
+    data = ambil_data(user.id)
+    quota = int(cfg()["quota"])
+    if int(data.get("terpakai", 0)) >= quota:
+        await message.reply_text(f"❌ Kuota hari ini sudah habis ({quota}/{quota}).")
+        return
+    wait = int(cfg()["delay"]) - (time.time() - float(data.get("terakhir", 0)))
+    if wait > 0:
+        await message.reply_text(f"⏳ Tunggu {int(wait) + 1} detik lagi sebelum kirim pesan berikutnya.")
+        return
+    post_id = cfg().get("post_chat_id")
+    if not post_id:
+        await message.reply_text("Tujuan Post belum diatur oleh admin. Silakan coba lagi nanti.")
+        return
+    try:
+        sent = await context.bot.send_message(chat_id=post_id, text=f"🔰 {escape(isi)}", parse_mode="HTML")
+        chat = await context.bot.get_chat(post_id)
+    except TelegramError:
+        await message.reply_text("❌ Gagal menerbitkan menfess. Admin perlu memeriksa tujuan Post dan izin bot.")
+        return
+    data["terpakai"] = int(data.get("terpakai", 0)) + 1
+    data["terakhir"] = time.time()
+    await simpan_data()
+    link = link_post(chat, sent.message_id)
+    await kirim_log(context, user, isi, link or "https://t.me/")
+    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Lihat postingan", url=link)]]) if link else None
+    remaining = max(0, quota - int(data["terpakai"]))
+    await message.reply_text(
+        f"✅ <b>Menfess berhasil dikirim!</b>\n\n📦 Sisa kuota: {remaining}/{quota}",
+        parse_mode="HTML", reply_markup=buttons,
     )
 
 
-# ==================== ADMIN: BAN / UNBAN ====================
-
-def adalah_admin(update: Update):
-    return update.effective_user.id in ADMIN_IDS
-
-
+# ==================== BAN / UNBAN ====================
 def cari_target(teks):
     teks = teks.strip()
     if teks.isdigit():
@@ -287,8 +493,8 @@ def cari_target(teks):
     nama = teks.lstrip("@").lower()
     if not nama:
         return None
-    for tabel in (DB["users"], DB["ban"]):
-        for uid, info in tabel.items():
+    for table in (DB["users"], DB["ban"]):
+        for uid, info in table.items():
             if info.get("username", "").lower() == nama:
                 return int(uid)
     return None
@@ -298,393 +504,441 @@ def label(uid):
     info = DB["ban"].get(str(uid)) or DB["users"].get(str(uid)) or {}
     if info.get("username"):
         return f"@{info['username']} ({uid})"
-    if info.get("nama"):
-        return f"{info['nama']} ({uid})"
-    return str(uid)
+    return f"{info.get('nama') or uid} ({uid})"
 
 
 def lakukan_ban(uid):
     info = DB["users"].get(str(uid), {})
-    DB["ban"][str(uid)] = {
-        "username": info.get("username", ""),
-        "nama": info.get("nama", ""),
-    }
-    simpan_data()
+    DB["ban"][str(uid)] = {"username": info.get("username", ""), "nama": info.get("nama", "")}
 
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not adalah_admin(update):
-        return
+    if not adalah_admin(update): return
     if not context.args:
-        await update.message.reply_text(
-            "Format:\n/ban id\n/ban @username\n\nContoh: /ban 123456789"
-        )
-        return
+        await update.message.reply_text("Format: /ban ID atau /ban @username"); return
     uid = cari_target(context.args[0])
     if uid is None:
-        await update.message.reply_text(
-            "User tidak ditemukan. Pakai @username hanya untuk pengguna yang pernah memakai bot ini; selain itu gunakan ID angka."
-        )
-        return
+        await update.message.reply_text("User tidak ditemukan."); return
     if uid in ADMIN_IDS:
-        await update.message.reply_text("Admin tidak bisa di-ban.")
-        return
-    if str(uid) in DB["ban"]:
-        await update.message.reply_text("User itu sudah di-ban.")
-        return
-    lakukan_ban(uid)
+        await update.message.reply_text("Admin tidak bisa di-ban."); return
+    lakukan_ban(uid); await simpan_data()
     await update.message.reply_text(f"🚫 {label(uid)} berhasil di-ban.")
 
 
 async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not adalah_admin(update):
-        return
+    if not adalah_admin(update): return
     if not context.args:
-        await update.message.reply_text(
-            "Format:\n/unban id\n/unban @username\n\nContoh: /unban 123456789"
-        )
-        return
+        await update.message.reply_text("Format: /unban ID atau /unban @username"); return
     uid = cari_target(context.args[0])
     if uid is None or str(uid) not in DB["ban"]:
-        await update.message.reply_text("User itu tidak sedang di-ban.")
-        return
-    nama = label(uid)
-    DB["ban"].pop(str(uid))
-    simpan_data()
-    await update.message.reply_text(f"✅ {nama} berhasil di-unban.")
+        await update.message.reply_text("User tidak sedang di-ban."); return
+    name = label(uid); DB["ban"].pop(str(uid), None); await simpan_data()
+    await update.message.reply_text(f"♻️ {name} berhasil di-unban.")
 
 
 async def banlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not adalah_admin(update):
-        return
+    if not adalah_admin(update): return
     if not DB["ban"]:
-        await update.message.reply_text("Tidak ada user yang di-ban.")
-        return
-    baris = [f"🚫 DAFTAR BAN ({len(DB['ban'])})", ""]
-    for nomor, uid in enumerate(DB["ban"], start=1):
-        baris.append(f"{nomor}. {label(uid)}")
-    baris.extend(["", "Buka ban dengan /unban id atau /unban @username"])
-    await update.message.reply_text("\n".join(baris))
+        await update.message.reply_text("Tidak ada user yang di-ban."); return
+    lines = [f"🚫 DAFTAR BAN ({len(DB['ban'])})", ""]
+    lines += [f"{i}. {label(uid)}" for i, uid in enumerate(DB["ban"], 1)]
+    await update.message.reply_text("\n".join(lines))
 
 
-async def tombol_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tombol_ban(update, context):
     query = update.callback_query
     if query.from_user.id not in ADMIN_IDS:
-        await query.answer("Khusus admin.", show_alert=True)
-        return
-    aksi, uid = query.data.split(":")
-    uid = int(uid)
-    if aksi == "ban":
+        await query.answer("Khusus admin.", show_alert=True); return
+    action, uid = query.data.split(":"); uid = int(uid)
+    if action == "ban":
         if uid in ADMIN_IDS:
-            await query.answer("Admin tidak bisa di-ban.", show_alert=True)
-            return
+            await query.answer("Admin tidak bisa di-ban.", show_alert=True); return
         lakukan_ban(uid)
-        await query.answer("🚫 User di-ban")
     else:
         DB["ban"].pop(str(uid), None)
-        simpan_data()
-        await query.answer("✅ User di-unban")
-    try:
-        await query.edit_message_reply_markup(reply_markup=papan_ban(uid))
-    except Exception as error:
-        print("Gagal mengubah tombol:", error)
+    await simpan_data()
+    await query.answer("Berhasil diperbarui.")
+    try: await query.edit_message_reply_markup(reply_markup=papan_ban(uid))
+    except TelegramError: pass
 
 
 # ==================== BROADCAST / PING ====================
-
 async def kirim_ke_semua(context, isi):
-    berhasil = gagal = 0
-    for uid in list(DB["users"].keys()):
+    ok = fail = 0
+    for uid in list(DB["users"]):
         try:
-            await context.bot.send_message(chat_id=int(uid), text=isi)
-            berhasil += 1
-        except Exception:
-            gagal += 1
-        await asyncio.sleep(0.1)
-    return berhasil, gagal
+            await context.bot.send_message(chat_id=int(uid), text=isi); ok += 1
+        except TelegramError:
+            fail += 1
+        await asyncio.sleep(0.08)
+    return ok, fail
 
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not adalah_admin(update):
-        return
-    _, _, isi = update.message.text.partition(" ")
-    isi = isi.strip()
+async def broadcast(update, context):
+    if not adalah_admin(update): return
+    isi = update.message.text.partition(" ")[2].strip()
     if not isi:
-        await update.message.reply_text(
-            "Format: /broadcast isi pesan\n\n"
-            "Contoh: /broadcast Halo semua, bot sedang maintenance malam ini."
-        )
-        return
+        await update.message.reply_text("Format: /broadcast isi pesan"); return
     await update.message.reply_text(f"📢 Mengirim ke {len(DB['users'])} pengguna...")
-    berhasil, gagal = await kirim_ke_semua(context, isi)
-    await update.message.reply_text(
-        f"✅ Broadcast selesai.\n\nTerkirim: {berhasil}\nGagal: {gagal}"
-    )
+    ok, fail = await kirim_ke_semua(context, isi)
+    await update.message.reply_text(f"✅ Selesai.\nTerkirim: {ok}\nGagal: {fail}")
 
 
 def uptime_teks():
     total = int(time.time() - waktu_mulai)
-    hari, sisa = divmod(total, 86400)
-    jam, sisa = divmod(sisa, 3600)
-    menit, detik = divmod(sisa, 60)
-    return f"{hari} hari {jam} jam {menit} menit {detik} detik"
+    d, rem = divmod(total, 86400); h, rem = divmod(rem, 3600); m, s = divmod(rem, 60)
+    return f"{d} hari {h} jam {m} menit {s} detik"
 
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mulai = time.time()
-    pesan = await update.message.reply_text("🏓 Pong...")
-    respon = int((time.time() - mulai) * 1000)
-    await pesan.edit_text(
-        "🏓 Pong! DMG Menfess Bot aktif ✅\n\n"
-        f"⚡ Respon: {respon} ms\n"
-        f"⏱️ Aktif: {uptime_teks()}"
-    )
+async def ping(update, context):
+    start_time = time.time()
+    msg = await update.message.reply_text("🏓 Pong...")
+    ms = int((time.time() - start_time) * 1000)
+    await msg.edit_text(f"🏓 DMG Menfess Bot aktif ✅\n⚡ Respon: {ms} ms\n⏱️ Aktif: {uptime_teks()}")
 
 
-# ==================== PANEL ADMIN ====================
+# ==================== SETTINGS / PANEL ====================
+def tombol_kembali(target="panel:menu"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data=target)]])
+
+
+def tombol_settings():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Ubah tujuan Post", callback_data="setting:post")],
+        [InlineKeyboardButton("📋 Ubah tujuan Logs", callback_data="setting:logs")],
+        [InlineKeyboardButton("⏱️ Atur Cooldown", callback_data="setting:delay")],
+        [InlineKeyboardButton("📦 Atur Kuota Harian", callback_data="setting:quota")],
+        [InlineKeyboardButton("🚫 Blacklist kata", callback_data="setting:blacklist")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="panel:menu")],
+    ])
+
 
 def teks_panel():
     return (
-        "🛠 <b>PANEL ADMIN</b>\n\n"
-        f"👥 Pengguna: {len(DB['users'])}\n"
-        f"🚫 Di-ban: {len(DB['ban'])}\n\n"
-        "Pilih menu di bawah ini."
+        "🛠 <b>PANEL ADMIN DMG MENFESS</b>\n\n"
+        f"👥 Pengguna: {len(DB['users'])}\n🚫 Di-ban: {len(DB['ban'])}\n"
+        f"🖼️ Media menunggu: {len(DB['pending_media'])}\n\n"
+        "Pilih menu:"
     )
 
 
 def tombol_menu_panel():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👥 Pengguna", callback_data="panel:users"),
-            InlineKeyboardButton("🚫 Daftar Ban", callback_data="panel:banlist"),
-        ],
-        [
-            InlineKeyboardButton("🔨 Ban", callback_data="panel:ban"),
-            InlineKeyboardButton("♻️ Unban", callback_data="panel:unban"),
-        ],
-        [
-            InlineKeyboardButton("📢 Broadcast", callback_data="panel:broadcast"),
-            InlineKeyboardButton("🏓 Status", callback_data="panel:status"),
-        ],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="panel:settings")],
+        [InlineKeyboardButton("🖼️ Pemeriksaan Media", callback_data="media:queue")],
+        [InlineKeyboardButton("👥 Pengguna", callback_data="panel:users"),
+         InlineKeyboardButton("🚫 Daftar Ban", callback_data="panel:banlist")],
+        [InlineKeyboardButton("🔨 Ban", callback_data="panel:ban"),
+         InlineKeyboardButton("♻️ Unban", callback_data="panel:unban")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="panel:broadcast"),
+         InlineKeyboardButton("🏓 Status", callback_data="panel:status")],
         [InlineKeyboardButton("❌ Tutup", callback_data="panel:tutup")],
     ])
 
 
-def tombol_kembali():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⬅️ Kembali", callback_data="panel:menu")
-    ]])
-
-
-async def tampilkan_banlist(query):
-    if not DB["ban"]:
-        await query.edit_message_text(
-            "Tidak ada user yang di-ban.", reply_markup=tombol_kembali()
-        )
-        return
-    baris = [f"🚫 DAFTAR BAN ({len(DB['ban'])})", ""]
-    tombol = []
-    for nomor, uid in enumerate(list(DB["ban"].keys())[:10], start=1):
-        baris.append(f"{nomor}. {label(uid)}")
-        tombol.append([InlineKeyboardButton(
-            f"♻️ Unban {nomor}", callback_data=f"panel:unb:{uid}"
-        )])
-    if len(DB["ban"]) > 10:
-        baris.append(f"\n...dan {len(DB['ban']) - 10} lainnya (pakai /unban id)")
-    tombol.append([InlineKeyboardButton("⬅️ Kembali", callback_data="panel:menu")])
-    await query.edit_message_text(
-        "\n".join(baris), reply_markup=InlineKeyboardMarkup(tombol)
-    )
-
-
-async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not adalah_admin(update):
-        return
+async def panel(update, context):
+    if not adalah_admin(update): return
     context.user_data.pop("menunggu", None)
-    await update.message.reply_text(
-        teks_panel(), parse_mode="HTML", reply_markup=tombol_menu_panel()
-    )
+    await update.message.reply_text(teks_panel(), parse_mode="HTML", reply_markup=tombol_menu_panel())
 
 
-async def batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not adalah_admin(update):
-        return
+async def batal(update, context):
+    if not adalah_admin(update): return
     context.user_data.pop("menunggu", None)
     context.user_data.pop("bc_teks", None)
     await update.message.reply_text("Dibatalkan. Ketik /panel untuk membuka panel.")
 
 
-async def tombol_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def validasi_tujuan(context, raw):
+    raw = raw.strip()
+    if raw.startswith("https://t.me/"):
+        raw = "@" + raw.rstrip("/").split("/")[-1]
+    chat = await context.bot.get_chat(raw)
+    if chat.type not in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
+        raise ValueError("Tujuan harus Channel atau Group.")
+    me = await context.bot.get_me()
+    member = await context.bot.get_chat_member(chat.id, me.id)
+    status = member.status
+    if chat.type == ChatType.CHANNEL and status not in ("administrator", "creator"):
+        raise ValueError("Bot harus menjadi admin Channel dan memiliki izin posting.")
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and status in ("left", "kicked"):
+        raise ValueError("Bot belum bergabung ke Group.")
+    return chat
+
+
+async def tampilkan_banlist(query):
+    if not DB["ban"]:
+        await query.edit_message_text("Tidak ada user yang di-ban.", reply_markup=tombol_kembali()); return
+    lines = [f"🚫 DAFTAR BAN ({len(DB['ban'])})", ""]
+    buttons = []
+    for i, uid in enumerate(list(DB["ban"])[:20], 1):
+        lines.append(f"{i}. {label(uid)}")
+        buttons.append([InlineKeyboardButton(f"♻️ Unban {i}", callback_data=f"panel:unb:{uid}")])
+    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="panel:menu")])
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def panel_callback(update, context):
     query = update.callback_query
     if query.from_user.id not in ADMIN_IDS:
-        await query.answer("Khusus admin.", show_alert=True)
-        return
-    aksi = query.data.split(":", 1)[1]
+        await query.answer("Khusus admin.", show_alert=True); return
     await query.answer()
-    try:
-        if aksi == "menu":
-            context.user_data.pop("menunggu", None)
-            await query.edit_message_text(
-                teks_panel(), parse_mode="HTML", reply_markup=tombol_menu_panel()
-            )
-        elif aksi == "users":
-            terbaru = list(DB["users"].keys())[-10:]
-            baris = [f"👥 Total pengguna: {len(DB['users'])}",
-                     f"🚫 Di-ban: {len(DB['ban'])}", ""]
-            if terbaru:
-                baris.append("Pengguna terbaru:")
-                for uid in reversed(terbaru):
-                    baris.append(f"• {label(uid)}")
-            await query.edit_message_text("\n".join(baris), reply_markup=tombol_kembali())
-        elif aksi == "banlist":
+    action = query.data.split(":", 1)[1]
+    if action == "bc_ya":
+        text = context.user_data.pop("bc_teks", None)
+        if not text:
+            await query.edit_message_text("Tidak ada pesan broadcast.", reply_markup=tombol_kembali())
+            return
+        await query.edit_message_text("📢 Broadcast sedang dikirim...")
+        ok, fail = await kirim_ke_semua(context, text)
+        await query.edit_message_text(f"✅ Broadcast selesai.\nTerkirim: {ok}\nGagal: {fail}", reply_markup=tombol_kembali())
+    elif action == "bc_batal":
+        context.user_data.pop("bc_teks", None)
+        await query.edit_message_text("Broadcast dibatalkan.", reply_markup=tombol_kembali())
+    elif action == "menu":
+        context.user_data.pop("menunggu", None)
+        await query.edit_message_text(teks_panel(), parse_mode="HTML", reply_markup=tombol_menu_panel())
+    elif action == "settings":
+        c = cfg()
+        await query.edit_message_text(
+            "⚙️ <b>SETTINGS BOT</b>\n\n"
+            f"📢 Post: {escape(str(c.get('post_name') or c.get('post_chat_id') or 'Belum diatur'))}\n"
+            f"📋 Logs: {escape(str(c.get('log_chat_id') or 'Belum diatur'))}\n"
+            f"⏱️ Cooldown: {c['delay']} detik\n📦 Kuota: {c['quota']} per hari\n"
+            f"🚫 Blacklist: {'Aktif' if c['blacklist_enabled'] else 'Nonaktif'}",
+            parse_mode="HTML", reply_markup=tombol_settings(),
+        )
+    elif action in ("users", "banlist", "ban", "unban", "broadcast", "status"):
+        if action == "users":
+            lines = [f"👥 Total pengguna: {len(DB['users'])}", ""]
+            for uid in list(DB["users"])[-15:][::-1]:
+                lines.append("• " + label(uid))
+            await query.edit_message_text("\n".join(lines), reply_markup=tombol_kembali())
+        elif action == "banlist":
             await tampilkan_banlist(query)
-        elif aksi.startswith("unb:"):
-            uid = aksi.split(":")[1]
-            DB["ban"].pop(uid, None)
-            simpan_data()
-            await tampilkan_banlist(query)
-        elif aksi in ("ban", "unban"):
-            context.user_data["menunggu"] = aksi
-            judul = "🔨 BAN USER" if aksi == "ban" else "♻️ UNBAN USER"
+        elif action in ("ban", "unban"):
+            context.user_data["menunggu"] = action
             await query.edit_message_text(
-                f"{judul}\n\nKirim ID atau @username user-nya sekarang.\n"
-                "Ketik /batal untuk membatalkan.",
+                f"Kirim ID atau @username untuk {action}.\nKetik /batal untuk membatalkan.",
                 reply_markup=tombol_kembali(),
             )
-        elif aksi == "broadcast":
+        elif action == "broadcast":
             context.user_data["menunggu"] = "broadcast"
+            await query.edit_message_text("Kirim teks broadcast.\nKetik /batal untuk membatalkan.", reply_markup=tombol_kembali())
+        elif action == "status":
+            c = cfg()
             await query.edit_message_text(
-                "📢 BROADCAST\n\nKirim isi pesan yang mau disebarkan sekarang.\n"
-                "Ketik /batal untuk membatalkan.",
+                f"🏓 BOT AKTIF\n\n⏱️ Uptime: {uptime_teks()}\n"
+                f"👥 Pengguna: {len(DB['users'])}\n🚫 Ban: {len(DB['ban'])}\n"
+                f"🖼️ Antrean media: {len(DB['pending_media'])}\n"
+                f"Cooldown: {c['delay']} detik\nKuota: {c['quota']}/hari",
                 reply_markup=tombol_kembali(),
             )
-        elif aksi == "bc_ya":
-            teks = context.user_data.pop("bc_teks", None)
-            if not teks:
-                await query.edit_message_text(
-                    "Tidak ada pesan untuk dikirim.", reply_markup=tombol_kembali()
-                )
-                return
-            await query.edit_message_text(
-                f"📢 Mengirim ke {len(DB['users'])} pengguna..."
-            )
-            berhasil, gagal = await kirim_ke_semua(context, teks)
-            await query.edit_message_text(
-                f"✅ Broadcast selesai.\n\nTerkirim: {berhasil}\nGagal: {gagal}",
-                reply_markup=tombol_kembali(),
-            )
-        elif aksi == "bc_batal":
-            context.user_data.pop("bc_teks", None)
-            await query.edit_message_text(
-                "Broadcast dibatalkan.", reply_markup=tombol_kembali()
-            )
-        elif aksi == "status":
-            await query.edit_message_text(
-                "🏓 <b>BOT AKTIF</b> ✅\n\n"
-                f"⏱️ Aktif: {uptime_teks()}\n"
-                f"👥 Pengguna: {len(DB['users'])}\n"
-                f"🚫 Di-ban: {len(DB['ban'])}",
-                parse_mode="HTML", reply_markup=tombol_kembali(),
-            )
-        elif aksi == "tutup":
-            context.user_data.pop("menunggu", None)
-            await query.message.delete()
-    except Exception as error:
-        print("Panel mengalami error:", error)
+    elif action.startswith("unb:"):
+        uid = action.split(":")[1]
+        DB["ban"].pop(uid, None); await simpan_data(); await tampilkan_banlist(query)
+    elif action == "tutup":
+        await query.message.delete()
 
 
-async def input_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+async def settings_callback(update, context):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Khusus admin.", show_alert=True); return
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    if action in ("post", "logs", "delay", "quota", "blacklist_add", "blacklist_remove"):
+        context.user_data["menunggu"] = "setting_" + action
+        prompts = {
+            "post": "Kirim ID atau username Channel/Group untuk tujuan Post.\nContoh: -1001234567890 atau @username",
+            "logs": "Kirim ID atau username Channel/Group untuk tujuan Logs.\nContoh: -1001234567890 atau @username",
+            "delay": "Kirim cooldown dalam detik. Contoh: 60",
+            "quota": "Kirim kuota menfess per hari. Contoh: 100",
+            "blacklist_add": "Kirim kata/frasa yang ingin ditambahkan ke blacklist.",
+            "blacklist_remove": "Kirim kata/frasa yang ingin dihapus dari blacklist.",
+        }
+        await query.message.reply_text(prompts[action] + "\nKetik /batal untuk membatalkan.")
+    elif action == "blacklist":
+        words = cfg().get("blacklist", [])
+        display = "\n".join("• " + escape(w) for w in words) if words else "Belum ada kata terlarang."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Tambah kata", callback_data="setting:blacklist_add")],
+            [InlineKeyboardButton("➖ Hapus kata", callback_data="setting:blacklist_remove")],
+            [InlineKeyboardButton(
+                "🔴 Nonaktifkan" if cfg()["blacklist_enabled"] else "🟢 Aktifkan",
+                callback_data="setting:blacklist_toggle",
+            )],
+            [InlineKeyboardButton("⬅️ Kembali", callback_data="panel:settings")],
+        ])
+        await query.edit_message_text(
+            f"🚫 <b>BLACKLIST</b>\nStatus: {'Aktif' if cfg()['blacklist_enabled'] else 'Nonaktif'}\n\n{display}",
+            parse_mode="HTML", reply_markup=keyboard,
+        )
+    elif action == "blacklist_toggle":
+        cfg()["blacklist_enabled"] = not cfg()["blacklist_enabled"]
+        await simpan_data()
+        words = cfg().get("blacklist", [])
+        display = "\n".join("• " + escape(w) for w in words) if words else "Belum ada kata terlarang."
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Tambah kata", callback_data="setting:blacklist_add")],
+            [InlineKeyboardButton("➖ Hapus kata", callback_data="setting:blacklist_remove")],
+            [InlineKeyboardButton("🔴 Nonaktifkan" if cfg()["blacklist_enabled"] else "🟢 Aktifkan", callback_data="setting:blacklist_toggle")],
+            [InlineKeyboardButton("⬅️ Kembali", callback_data="panel:settings")],
+        ])
+        await query.edit_message_text(
+            f"🚫 <b>BLACKLIST</b>\nStatus: {'Aktif' if cfg()['blacklist_enabled'] else 'Nonaktif'}\n\n{display}",
+            parse_mode="HTML", reply_markup=keyboard,
+        )
+
+
+async def input_admin(update, context):
+    if not update.effective_user or update.effective_user.id not in ADMIN_IDS or not update.message:
         return
     mode = context.user_data.get("menunggu")
     if not mode:
         return
-    teks = update.message.text.strip()
-    context.user_data.pop("menunggu", None)
+    value = update.message.text.strip()
     if mode == "broadcast":
-        context.user_data["bc_teks"] = teks
-        tombol = InlineKeyboardMarkup([[
+        context.user_data.pop("menunggu", None)
+        context.user_data["bc_teks"] = value
+        keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Kirim", callback_data="panel:bc_ya"),
             InlineKeyboardButton("❌ Batal", callback_data="panel:bc_batal"),
         ]])
         await update.message.reply_text(
-            f"📢 Pesan ini akan dikirim ke {len(DB['users'])} pengguna:\n\n"
-            f"{teks}\n\nKirim sekarang?",
-            reply_markup=tombol,
+            f"Pesan akan dikirim ke {len(DB['users'])} pengguna:\n\n{value}\n\nKirim sekarang?",
+            reply_markup=keyboard,
         )
-    else:
-        uid = cari_target(teks)
+        raise ApplicationHandlerStop
+    if mode in ("ban", "unban"):
+        context.user_data.pop("menunggu", None)
+        uid = cari_target(value)
         if uid is None:
-            hasil = (
-                "User tidak ditemukan. Pakai @username hanya untuk pengguna "
-                "yang pernah memakai bot ini; selain itu gunakan ID angka."
-            )
+            await update.message.reply_text("User tidak ditemukan.")
         elif mode == "ban":
             if uid in ADMIN_IDS:
-                hasil = "Admin tidak bisa di-ban."
-            elif str(uid) in DB["ban"]:
-                hasil = "User itu sudah di-ban."
+                await update.message.reply_text("Admin tidak bisa di-ban.")
             else:
-                lakukan_ban(uid)
-                hasil = f"🚫 {label(uid)} berhasil di-ban."
+                lakukan_ban(uid); await simpan_data()
+                await update.message.reply_text(f"🚫 {label(uid)} berhasil di-ban.")
         else:
             if str(uid) not in DB["ban"]:
-                hasil = "User itu tidak sedang di-ban."
+                await update.message.reply_text("User tidak sedang di-ban.")
             else:
-                nama = label(uid)
-                DB["ban"].pop(str(uid))
-                simpan_data()
-                hasil = f"✅ {nama} berhasil di-unban."
-        await update.message.reply_text(hasil, reply_markup=tombol_kembali())
-    raise ApplicationHandlerStop
+                name = label(uid); DB["ban"].pop(str(uid)); await simpan_data()
+                await update.message.reply_text(f"♻️ {name} berhasil di-unban.")
+        raise ApplicationHandlerStop
+    if mode.startswith("setting_"):
+        setting = mode[len("setting_"):]
+        try:
+            if setting in ("post", "logs"):
+                chat = await validasi_tujuan(context, value)
+                if setting == "post":
+                    cfg()["post_chat_id"] = chat.id
+                    cfg()["post_name"] = ("@" + chat.username) if chat.username else (chat.title or str(chat.id))
+                    label_setting = "Post"
+                else:
+                    cfg()["log_chat_id"] = chat.id
+                    label_setting = "Logs"
+                result = f"✅ Tujuan {label_setting} berhasil diubah ke {chat.title or chat.username or chat.id}\nID: {chat.id}"
+            elif setting == "delay":
+                number = int(value)
+                if number < 0 or number > 86400:
+                    raise ValueError("Cooldown harus antara 0 sampai 86400 detik.")
+                cfg()["delay"] = number
+                result = f"✅ Cooldown diubah menjadi {number} detik."
+            elif setting == "quota":
+                number = int(value)
+                if number < 1 or number > 100000:
+                    raise ValueError("Kuota harus antara 1 sampai 100000.")
+                cfg()["quota"] = number
+                result = f"✅ Kuota harian diubah menjadi {number}."
+            elif setting == "blacklist_add":
+                if not value:
+                    raise ValueError("Kata tidak boleh kosong.")
+                words = cfg().setdefault("blacklist", [])
+                if any(normalize_word(x) == normalize_word(value) for x in words):
+                    raise ValueError("Kata tersebut sudah ada.")
+                words.append(value)
+                result = f"✅ Kata/frasa '{value}' ditambahkan ke blacklist."
+            elif setting == "blacklist_remove":
+                words = cfg().setdefault("blacklist", [])
+                match = next((x for x in words if normalize_word(x) == normalize_word(value)), None)
+                if match is None:
+                    raise ValueError("Kata tersebut tidak ditemukan.")
+                words.remove(match)
+                result = f"✅ Kata/frasa '{match}' dihapus dari blacklist."
+            else:
+                result = "Pengaturan tidak dikenal."
+            await simpan_data()
+            context.user_data.pop("menunggu", None)
+            await update.message.reply_text(result, reply_markup=tombol_kembali("panel:settings"))
+        except (ValueError, TelegramError) as exc:
+            await update.message.reply_text(f"⚠️ {exc}\nCoba lagi atau /batal.")
+        raise ApplicationHandlerStop
 
 
-# ==================== ERROR HANDLER ====================
+async def tombol_panel_lanjutan(update, context):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Khusus admin.", show_alert=True); return
+    action = query.data.split(":", 1)[1]
+    if action == "bc_ya":
+        await query.answer()
+        text = context.user_data.pop("bc_teks", None)
+        if not text:
+            await query.message.reply_text("Tidak ada pesan broadcast."); return
+        await query.edit_message_text("📢 Broadcast sedang dikirim...")
+        ok, fail = await kirim_ke_semua(context, text)
+        await query.edit_message_text(f"✅ Broadcast selesai.\nTerkirim: {ok}\nGagal: {fail}", reply_markup=tombol_kembali())
+    elif action == "bc_batal":
+        await query.answer("Dibatalkan.")
+        context.user_data.pop("bc_teks", None)
+        await query.edit_message_text("Broadcast dibatalkan.", reply_markup=tombol_kembali())
+
+
+# ==================== ROUTER PESAN ====================
+async def router_pesan(update, context):
+    message, user = update.effective_message, update.effective_user
+    if not message or not user:
+        return
+    if user.id in ADMIN_IDS and message.text and await input_admin(update, context):
+        return
+    if pesan_media(message):
+        await proses_media(update, context)
+    elif message.text and not message.text.startswith("/"):
+        await kirim_menfess(update, context)
+
 
 async def tangani_error(update, context):
     print("Terjadi error:", context.error)
 
 
-# ==================== MAIN ====================
-
 def main():
     app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .write_timeout(30)
-        .pool_timeout(30)
-        .get_updates_connect_timeout(30)
-        .get_updates_read_timeout(40)
-        .get_updates_write_timeout(30)
-        .get_updates_pool_timeout(30)
-        .build()
+        Application.builder().token(BOT_TOKEN)
+        .connect_timeout(30).read_timeout(30).write_timeout(30).pool_timeout(30)
+        .get_updates_connect_timeout(30).get_updates_read_timeout(40)
+        .get_updates_write_timeout(30).get_updates_pool_timeout(30).build()
     )
-    pribadi = filters.ChatType.PRIVATE
-
-    app.add_handler(CommandHandler("start", start, filters=pribadi))
-    app.add_handler(CommandHandler("ban", ban, filters=pribadi))
-    app.add_handler(CommandHandler("unban", unban, filters=pribadi))
-    app.add_handler(CommandHandler("banlist", banlist, filters=pribadi))
-    app.add_handler(CommandHandler("broadcast", broadcast, filters=pribadi))
-    app.add_handler(CommandHandler("ping", ping, filters=pribadi))
-    app.add_handler(CommandHandler("panel", panel, filters=pribadi))
-    app.add_handler(CommandHandler("batal", batal, filters=pribadi))
+    private = filters.ChatType.PRIVATE
+    app.add_handler(CommandHandler("start", start, filters=private))
+    app.add_handler(CommandHandler("ban", ban, filters=private))
+    app.add_handler(CommandHandler("unban", unban, filters=private))
+    app.add_handler(CommandHandler("banlist", banlist, filters=private))
+    app.add_handler(CommandHandler("broadcast", broadcast, filters=private))
+    app.add_handler(CommandHandler("ping", ping, filters=private))
+    app.add_handler(CommandHandler("panel", panel, filters=private))
+    app.add_handler(CommandHandler("batal", batal, filters=private))
 
     app.add_handler(CallbackQueryHandler(ui_callback, pattern=r"^ui:"))
-    app.add_handler(CallbackQueryHandler(tombol_panel, pattern=r"^panel:"))
+    app.add_handler(CallbackQueryHandler(panel_callback, pattern=r"^panel:"))
+    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^setting:"))
+    app.add_handler(CallbackQueryHandler(media_callback, pattern=r"^media:"))
     app.add_handler(CallbackQueryHandler(tombol_ban, pattern=r"^(ban|unban):\d+$"))
 
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & pribadi, input_admin),
-        group=-1,
-    )
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND & pribadi, kirim_menfess)
-    )
+    app.add_handler(MessageHandler(private & ~filters.COMMAND, router_pesan))
     app.add_error_handler(tangani_error)
-
     print("DMG Menfess Bot berjalan...")
     app.run_polling(timeout=20)
 

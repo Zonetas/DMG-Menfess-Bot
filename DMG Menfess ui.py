@@ -1131,7 +1131,7 @@ def main():
 
     app.add_handler(MessageHandler(private & ~filters.COMMAND, router_pesan))
     app.add_error_handler(tangani_error)
-    print("DMG Menfess Bot berjalan🚀...")
+    print("DMG Menfess Bot berjalan...")
     app.run_polling(timeout=20)
 
 

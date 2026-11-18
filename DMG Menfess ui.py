@@ -254,7 +254,7 @@ def keyboard_force_sub():
     for item in cfg().get("force_subs", []):
         if item.get("enabled", True):
             rows.append([InlineKeyboardButton(
-                "📢 Gabung " + str(item.get("title") or "Grup/Channel")[:45],
+                "📢 " + str(item.get("title") or "Grup/Channel")[:50],
                 url=item["link"]
             )])
     rows.append([InlineKeyboardButton("🔄 Saya sudah bergabung", callback_data="ui:cek_sub")])
@@ -875,9 +875,10 @@ async def settings_callback(update, context):
             "hashtag_add": "Kirim hashtag yang ingin ditambahkan. Contoh: #fwbgirl",
             "hashtag_remove": "Kirim hashtag yang ingin dihapus. Contoh: #fwbgirl",
             "fsub_add": (
-                "Kirim ID/username tujuan dan link join dipisahkan tanda |.\n"
-                "Contoh: @namachannel | https://t.me/namachannel\n"
-                "Untuk tujuan privat, gunakan ID -100... dan link undangan."
+                "Kirim ID angka Channel/Group yang ingin dijadikan Force Subscribe.\n"
+                "Contoh: -1001234567890\n\n"
+                "Bot akan mengambil nama tujuan dan membuat link undangan otomatis.\n"
+                "Pastikan bot sudah menjadi admin dan memiliki izin Invite Users / Undang Pengguna."
             ),
         }
         await query.message.reply_text(prompts[action] + "\nKetik /batal untuk membatalkan.")
@@ -1039,27 +1040,36 @@ async def input_admin(update, context):
                 tujuan = cfg().setdefault("force_subs", [])
                 if len(tujuan) >= 3:
                     raise ValueError("Maksimal 3 tujuan Force Subscribe.")
-                if "|" not in value:
-                    raise ValueError("Format: ID/username | link join.")
-                raw_chat, link = [x.strip() for x in value.split("|", 1)]
-                if not link.startswith("https://t.me/"):
-                    raise ValueError("Link join harus berupa https://t.me/...")
-                chat = await context.bot.get_chat(raw_chat)
+                if not re.fullmatch(r"-?\d+", value):
+                    raise ValueError("Masukkan ID chat berupa angka saja. Contoh: -1001234567890")
+                chat = await context.bot.get_chat(int(value))
                 if chat.type not in (ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP):
-                    raise ValueError("Tujuan harus berupa grup atau channel.")
+                    raise ValueError("ID tersebut bukan ID grup atau channel.")
+                if any(str(x.get("chat_id")) == str(chat.id) for x in tujuan):
+                    raise ValueError("Tujuan tersebut sudah terdaftar.")
                 me = await context.bot.get_me()
                 bot_member = await context.bot.get_chat_member(chat.id, me.id)
                 if bot_member.status not in ("administrator", "creator"):
                     raise ValueError("Bot harus menjadi admin di grup/channel.")
-                if any(str(x.get("chat_id")) == str(chat.id) for x in tujuan):
-                    raise ValueError("Tujuan tersebut sudah terdaftar.")
+                if bot_member.status == "administrator" and not getattr(bot_member, "can_invite_users", False):
+                    raise ValueError("Bot harus diberi izin Invite Users / Undang Pengguna.")
+                try:
+                    invite = await context.bot.create_chat_invite_link(
+                        chat_id=chat.id,
+                        name="DMG Menfess Force Subscribe",
+                    )
+                except TelegramError as exc:
+                    raise ValueError(
+                        "Bot gagal membuat link undangan. Pastikan bot admin dan memiliki izin Invite Users / Undang Pengguna."
+                    ) from exc
+                title = chat.title or chat.username or str(chat.id)
                 tujuan.append({
                     "chat_id": chat.id,
-                    "title": chat.title or chat.username or str(chat.id),
-                    "link": link,
+                    "title": title,
+                    "link": invite.invite_link,
                     "enabled": True,
                 })
-                result = f"✅ Force Subscribe ditambahkan: {chat.title or chat.username or chat.id}"
+                result = f"✅ Force Subscribe ditambahkan: {title}\nLink undangan berhasil dibuat otomatis."
             else:
                 result = "Pengaturan tidak dikenal."
             await simpan_data()

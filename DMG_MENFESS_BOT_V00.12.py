@@ -573,7 +573,7 @@ async def kirim_menfess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Tujuan Post belum diatur oleh admin. Silakan coba lagi nanti.")
         return
     try:
-        sent = await context.bot.send_message(chat_id=post_id, text=f"🔰 {escape(isi)}", parse_mode="HTML")
+        sent = await context.bot.send_message(chat_id=post_id, text=escape(isi), parse_mode="HTML")
         chat = await context.bot.get_chat(post_id)
     except TelegramError:
         await message.reply_text("❌ Gagal menerbitkan menfess. Admin perlu memeriksa tujuan Post dan izin bot.")

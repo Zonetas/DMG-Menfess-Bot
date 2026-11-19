@@ -660,8 +660,11 @@ async def terbitkan_media(context, pending_id, admin_id, query):
                 )
             except TelegramError:
                 await context.bot.send_message(
-                    chat_id=post_id, text=footer, parse_mode="HTML",
-                    reply_to_message_id=copied.message_id,
+    chat_id=post_id,
+    text=footer,
+    parse_mode="HTML",
+    reply_to_message_id=copied.message_id,
+    disable_web_page_preview=True,
                 )
         else:
             await context.bot.send_message(
@@ -803,12 +806,21 @@ async def kirim_menfess(update: Update, context: ContextTypes.DEFAULT_TYPE):
         footer = await footer_menfess(context)
         post_text = f"{escape(isi)}\n\n{footer}"
         if len(post_text) <= 4096:
-            sent = await context.bot.send_message(chat_id=post_id, text=post_text, parse_mode="HTML")
+            sent = await context.bot.send_message(
+    chat_id=post_id,
+    text=post_text,
+    parse_mode="HTML",
+    disable_web_page_preview=True,
+            )
         else:
             sent = await context.bot.send_message(chat_id=post_id, text=escape(isi), parse_mode="HTML")
             await context.bot.send_message(
-                chat_id=post_id, text=footer, parse_mode="HTML",
-                reply_to_message_id=sent.message_id,
+    chat_id=post_id,
+    text=footer,
+    parse_mode="HTML",
+    reply_to_message_id=sent.message_id,
+    disable_web_page_preview=True,
+            )
             )
         chat = await context.bot.get_chat(post_id)
     except TelegramError:
